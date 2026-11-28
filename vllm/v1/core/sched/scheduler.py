@@ -294,6 +294,9 @@ class Scheduler(SchedulerInterface):
         # update_from_output.
         self.grammar_compile_error_reqs: dict[str, RequestError] = {}
         self.encoder_cache_mismatch_reqs: set[str] = set()
+        # Multimodal input indices whose payload was stripped from the
+        # worker-bound NewRequestData by strip_covered_mm_data.
+        self._worker_stripped_mm_inputs: dict[str, set[int]] = {}
         self._ec_metadata_resolver: PlaceholderMetadataResolver | None = None
 
         # Encoder-related.
@@ -1713,15 +1716,27 @@ class Scheduler(SchedulerInterface):
         )
 
         # Construct the scheduler output.
-        new_reqs_data = [
-            NewRequestData.from_request(
+        new_reqs_data: list[NewRequestData] = []
+        for req in scheduled_new_reqs:
+            req_data = NewRequestData.from_request(
                 req,
                 req_to_new_blocks[req.request_id].get_block_ids(),
                 req.prefill_token_ids,
                 uses_mrope=self.model_uses_mrope,
             )
-            for req in scheduled_new_reqs
-        ]
+            new_reqs_data.append(req_data)
+            if req.mm_features:
+                stripped_indices = {
+                    idx
+                    for idx, (orig, sent) in enumerate(
+                        zip(req.mm_features, req_data.mm_features)
+                    )
+                    if sent is not orig
+                }
+                if stripped_indices:
+                    self._worker_stripped_mm_inputs[req.request_id] = stripped_indices
+                else:
+                    self._worker_stripped_mm_inputs.pop(req.request_id, None)
 
         with record_function_or_nullcontext("schedule: make_cached_request_data"):
             cached_reqs_data = self._make_cached_request_data(
@@ -1890,6 +1905,7 @@ class Scheduler(SchedulerInterface):
         self._free_request_blocks(request)
         self.encoder_cache_manager.free(request)
         self._pending_encoder_input_ids.pop(request.request_id, None)
+        self._worker_stripped_mm_inputs.pop(request.request_id, None)
         self._inflight_prefills.discard(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
@@ -2106,11 +2122,27 @@ class Scheduler(SchedulerInterface):
     def _reject_on_missing_encoder_input(self, request: Request, input_id: int) -> bool:
         """Fail a request whose item would be encoded here with no input.
 
-        A metadata-only item (the consumer side of EPD) can only be served from
-        the EC connector or from transferred KV. When neither covers it, such as
-        an EC miss or a KV consumer recomputing a failed load, scheduling a
-        local encode would hand the model no pixels and kill the engine core.
+        This covers two cases where the worker does not have the encoder
+        payload and neither the local encoder cache nor the EC connector
+        covers it:
+        1. The payload was stripped when constructing NewRequestData via
+           strip_covered_mm_data, so the worker-side copy has no tensors.
+        2. A metadata-only item (the consumer side of EPD) whose placeholder
+           metadata cannot be encoded locally.
         """
+        if input_id in self._worker_stripped_mm_inputs.get(request.request_id, ()):
+            feature = request.mm_features[input_id]
+            logger.warning(
+                "Request %s input %d (identifier %r) had its multimodal payload "
+                "stripped when sent to workers and neither the local encoder "
+                "cache nor the EC connector covers it; failing the request "
+                "instead of scheduling a local encode with no payload.",
+                request.request_id,
+                input_id,
+                feature.identifier,
+            )
+            self.encoder_cache_mismatch_reqs.add(request.request_id)
+            return True
         mm_config = self.vllm_config.model_config.multimodal_config
         if (
             mm_config is None
@@ -3327,6 +3359,7 @@ class Scheduler(SchedulerInterface):
 
         self.encoder_cache_manager.free(request)
         self._pending_encoder_input_ids.pop(request.request_id, None)
+        self._worker_stripped_mm_inputs.pop(request.request_id, None)
         request_id = request.request_id
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:

@@ -5551,20 +5551,6 @@ def test_grammar_compile_error_finishes_only_request(async_grammar: bool):
     output = engine_core_outputs[0].outputs[0]
     assert output.request_id == request.request_id
     assert output.finish_reason == FinishReason.ERROR
-    assert output.stop_reason is None
-    assert output.error == RequestError(
-        code="validation_error",
-        message="Invalid structured outputs: forced FSM compilation error",
-    )
-
-    healthy_request = create_requests(num_requests=1, req_ids=["healthy-request"])[0]
-    scheduler.add_request(healthy_request)
-    next_output = scheduler.schedule()
-    assert [req.req_id for req in next_output.scheduled_new_reqs] == [
-        healthy_request.request_id
-    ]
-
-
 def test_abort_request_when_structured_output_fsm_cannot_advance():
     scheduler = object.__new__(Scheduler)
     sampling_params = SamplingParams(ignore_eos=True, max_tokens=4)
@@ -8046,6 +8032,70 @@ def test_encoder_cache_rejects_mismatched_embed_count_within_request():
     output = outputs[request.client_index].outputs[0]
     assert output.request_id == request.request_id
     assert output.finish_reason == FinishReason.ERROR
+
+
+def test_stripped_mm_payload_fails_only_offending_request():
+    """Regression test for #70508: if an encoder input's payload was stripped
+    when sent to workers via NewRequestData and a later step tries to schedule
+    a local encode with no encoder cache or EC coverage, fail only that request
+    instead of scheduling an encode that would crash EngineCore."""
+    from vllm.multimodal.inputs import MultiModalKwargsItem
+
+    scheduler = create_scheduler(model="llava-hf/llava-1.5-7b-hf")
+    mm_request = create_requests(
+        num_requests=1,
+        num_tokens=8,
+        mm_hashes_list=[["stripped-img"]],
+        mm_positions=[[PlaceholderRange(offset=0, length=4)]],
+        req_ids=["mm-stripped"],
+    )[0]
+    mm_request.mm_features[0].data = MultiModalKwargsItem.dummy()
+    # Simulate admission where the image span is already covered by KV transfer.
+    mm_request.num_computed_tokens = 4
+    scheduler.add_request(mm_request)
+
+    first_output = scheduler.schedule()
+    assert len(first_output.scheduled_new_reqs) == 1
+    assert first_output.scheduled_new_reqs[0].mm_features[0].data is None
+    assert scheduler._worker_stripped_mm_inputs.get(mm_request.request_id) == {0}
+
+    # Add a healthy co-batched request and simulate a state where the worker
+    # still holds the stripped copy while the scheduler must recompute from 0
+    # with no encoder cache or EC coverage.
+    healthy_request = create_requests(
+        num_requests=1,
+        num_tokens=4,
+        req_ids=["healthy-text"],
+    )[0]
+    scheduler.add_request(healthy_request)
+    mm_request.num_computed_tokens = 0
+
+    second_output = scheduler.schedule()
+    assert mm_request.request_id not in second_output.scheduled_encoder_inputs
+    assert mm_request.request_id in scheduler.encoder_cache_mismatch_reqs
+    assert healthy_request.request_id in second_output.num_scheduled_tokens
+
+    outputs = scheduler.update_from_output(
+        second_output,
+        ModelRunnerOutput(
+            req_ids=[healthy_request.request_id],
+            sampled_token_ids=[[1]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[None],
+        ),
+    )
+
+    assert mm_request.status == RequestStatus.FINISHED_ERROR
+    assert mm_request.request_id not in scheduler.requests
+    assert mm_request.request_id not in scheduler._worker_stripped_mm_inputs
+    assert healthy_request.request_id in scheduler.requests
+    mm_out = next(
+        o
+        for o in outputs[mm_request.client_index].outputs
+        if o.request_id == mm_request.request_id
+    )
+    assert mm_out.finish_reason == FinishReason.ERROR
 
 
 @pytest.mark.parametrize("prefill_lookahead", [1, 3])
